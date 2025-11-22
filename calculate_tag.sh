@@ -17,7 +17,10 @@ set -eu
 
 DEBUG=${DEBUG:-0}
 log() {
-  [ "$DEBUG" = "1" ] && printf '[DEBUG] %s\n' "$*" >&2
+  if [ "$DEBUG" = "1" ]; then
+    printf '[DEBUG] %s\n' "$*" >&2
+  fi
+  return 0
 }
 
 safe_slug() {
