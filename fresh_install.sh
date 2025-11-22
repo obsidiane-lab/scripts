@@ -50,7 +50,6 @@ apt autoremove -y
 log "Langue et fuseau horaire"
 apt install -y language-pack-fr language-pack-gnome-fr-base
 localectl set-locale LANG=fr_FR.UTF-8
-timedatectl set-timezone Europe/Paris
 
 log "Configuration SSH (port 2222, root par cle uniquement)"
 apt install -y openssh-server
