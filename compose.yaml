@@ -1,0 +1,17 @@
+services:
+  ubuntu-init-test:
+    image: jrei/systemd-ubuntu:24.04
+    container_name: ubuntu-init-test
+    privileged: true
+    environment:
+      - container=docker
+      - DEBIAN_FRONTEND=noninteractive
+    volumes:
+      - ./fresh_install.sh:/root/fresh_install.sh:ro
+      - /sys/fs/cgroup:/sys/fs/cgroup
+    tmpfs:
+      - /run
+      - /run/lock
+      - /tmp
+    stdin_open: true
+    tty: true
