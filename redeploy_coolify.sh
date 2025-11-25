@@ -2,10 +2,9 @@
 # ----------------------------------------------------------------------------
 # redeploy_coolify.sh
 # Synchronise les variables CI commençant par SF_ (sans préfixe SF_ dans Coolify) et redéploie l'application
-# Conçu pour GitLab CI avec runner Docker (dind)
-# Usage: redeploy_coolify.sh <VERSION_TAG>
-# Variables CI requises (Settings > CI/CD > Variables):
-#   COOLIFY_API_URL, COOLIFY_TOKEN, COOLIFY_APP_UUID, CI_REGISTRY_IMAGE
+# Usage: redeploy_coolify.sh (SF_APP_VERSION optionnel pour le log)
+# Variables CI requises :
+#   COOLIFY_API_URL, COOLIFY_TOKEN, COOLIFY_APP_UUID
 # ----------------------------------------------------------------------------
 
 set -euo pipefail
@@ -24,21 +23,15 @@ for cmd in bash curl jq mktemp grep env; do
   fi
 done
 
-
-if [[ -z "$SF_APP_VERSION" ]]; then
-  echo "Usage: $0 <SF_APP_VERSION>" >&2
-  exit 1
-fi
-
 # --- Variables CI obligatoires ---
 : "${COOLIFY_API_URL:?COOLIFY_API_URL non défini}"
 : "${COOLIFY_TOKEN:?COOLIFY_TOKEN non défini}"
 : "${COOLIFY_APP_UUID:?COOLIFY_APP_UUID non défini}"
-: "${CI_REGISTRY_IMAGE:?CI_REGISTRY_IMAGE non défini}"
 
 API_URL="$COOLIFY_API_URL"
 TOKEN="$COOLIFY_TOKEN"
 APP_UUID="$COOLIFY_APP_UUID"
+APP_VERSION="${SF_APP_VERSION:-"(non spécifiée)"}"
 
 AUTH_HEADER=( -H "Authorization: Bearer $TOKEN" )
 JSON_HEADER=( -H "Content-Type: application/json" )
@@ -59,66 +52,77 @@ curl_retry() {
   return 1
 }
 
-cleanup() { rm -f "$TMP_OUT" "$TMP_ENV"; }
+cleanup() { rm -f "$TMP_OUT" "$TMP_ENV" "$TMP_UPDATES"; }
 trap cleanup EXIT
 
 TMP_OUT=$(mktemp)
 TMP_ENV=$(mktemp)
+TMP_UPDATES=$(mktemp)
 
-# 1) Extraction des SF_ puis suppression du préfixe
-log "1/4 | Extraction et renommage des variables SF_"
-env | grep -E '^SF_' > "$TMP_ENV" || { log "❌ Impossible de lister env"; exit 1; }
-
-# Construct payload with stripped keys
-payload=$(jq -Rn '
-  [inputs
-    | capture("(?<raw>SF_(?<key>[^=]+))=(?<value>.*)")
-    | { key: .key, value: .value }
-  ]
-  | { data: . }' < "$TMP_ENV") || { log "❌ Échec JSON"; exit 1; }
-
-mapfile -t KEYS < <(jq -r '.data[].key' <<<"$payload")
-log "📋 Variables à synchroniser sans SF_: ${KEYS[*]}"
-
-# 2) Suppression des variables obsolètes (sans SF_)
-log "2/4 | Suppression des variables obsolètes"
-existing=$(curl_retry "${AUTH_HEADER[@]}" -X GET "$API_URL/applications/$APP_UUID/envs")
-
-echo "$existing" | jq -r '.[] | "\(.uuid)\t\(.key)"' \
-  | while IFS=$'\t' read -r uuid key; do
-    if ! printf '%s\n' "${KEYS[@]}" | grep -Fxq -- "$key"; then
-      log "🗑 Suppression $key (UUID $uuid)"
-      curl_retry "${AUTH_HEADER[@]}" -X DELETE "$API_URL/applications/$APP_UUID/envs/$uuid" &>/dev/null ||
-        log "⚠️ Échec suppression $key"
-    fi
-done
-
-# 3) Bulk update (clé sans SF_)
-log "3/4 | Bulk update des variables (sans SF_)"
-bulk_code=$(curl -s --max-time $TIMEOUT -w "%{http_code}" -o "$TMP_OUT" \
-  "${AUTH_HEADER[@]}" "${JSON_HEADER[@]}" \
-  -X PATCH "$API_URL/applications/$APP_UUID/envs/bulk" \
-  -d "$payload"
-)
-if [[ "$bulk_code" =~ ^2 ]]; then
-  log "✅ Bulk update OK"
+# 1) Extraction des SF_ puis suppression du préfixe (sans suppression des variables existantes)
+log "1/3 | Extraction et renommage des variables SF_"
+mapfile -t SF_VARS < <(env | grep -E '^SF_' || true)
+if ((${#SF_VARS[@]} == 0)); then
+  log "ℹ️ Aucune variable SF_ détectée; aucune synchro nécessaire côté env"
 else
-  log "⚠️ Bulk KO ($bulk_code), fallback individuel"
-  while IFS=$'\t' read -r raw_line; do
-    # raw_line format SF_KEY=VALUE
-    IFS='=' read -r raw val <<<"$raw_line"
-    key=${raw#SF_}
-    if [[ " ${KEYS[*]} " =~ " $key " ]]; then
+  printf '%s\n' "${SF_VARS[@]}" > "$TMP_ENV"
+fi
+
+if [[ -s "$TMP_ENV" ]]; then
+  existing=$(curl_retry "${AUTH_HEADER[@]}" -X GET "$API_URL/applications/$APP_UUID/envs") || { log "❌ Impossible de récupérer les variables existantes"; exit 1; }
+
+  declare -A CURRENT_VALUES
+  while IFS=$'\t' read -r key value; do
+    CURRENT_VALUES["$key"]="$value"
+  done < <(echo "$existing" | jq -r '.[] | "\(.key)\t\(.value)"')
+
+  KEYS=()
+  while IFS= read -r line; do
+    raw_key="${line%%=*}"
+    value="${line#*=}"
+    key="${raw_key#SF_}"
+    KEYS+=("$key")
+
+    if [[ -v CURRENT_VALUES["$key"] && "${CURRENT_VALUES[$key]}" == "$value" ]]; then
+      continue
+    fi
+
+    jq -n --arg k "$key" --arg v "$value" \
+      '{key:$k,value:$v,is_build_time:true,is_literal:true}' >> "$TMP_UPDATES"
+  done < "$TMP_ENV"
+
+  log "📋 Variables SF_ détectées (préfixe retiré): ${KEYS[*]}"
+fi
+
+# 2) Mises à jour ou ajouts ciblés des variables SF_ (sans toucher aux autres)
+if [[ -s "$TMP_UPDATES" ]]; then
+  payload=$(jq -s '{data: .}' "$TMP_UPDATES") || { log "❌ Échec construction JSON"; exit 1; }
+  log "2/3 | Mise à jour/ajout des variables SF_ (aucune suppression des existantes)"
+  bulk_code=$(curl -s --max-time $TIMEOUT -w "%{http_code}" -o "$TMP_OUT" \
+    "${AUTH_HEADER[@]}" "${JSON_HEADER[@]}" \
+    -X PATCH "$API_URL/applications/$APP_UUID/envs/bulk" \
+    -d "$payload"
+  )
+  if [[ "$bulk_code" =~ ^2 ]]; then
+    log "✅ Variables SF_ synchronisées (bulk)"
+  else
+    log "⚠️ Bulk KO ($bulk_code), fallback individuel"
+    while IFS= read -r update_line; do
+      [[ -z "$update_line" ]] && continue
+      key=$(jq -r '.key' <<<"$update_line")
+      val=$(jq -r '.value' <<<"$update_line")
       single=$(jq -n --arg k "$key" --arg v "$val" '{key:$k,value:$v,is_build_time:true,is_literal:true}')
       curl_retry "${AUTH_HEADER[@]}" "${JSON_HEADER[@]}" -X PATCH "$API_URL/applications/$APP_UUID/envs" -d "$single" \
         || curl_retry "${AUTH_HEADER[@]}" "${JSON_HEADER[@]}" -X POST "$API_URL/applications/$APP_UUID/envs" -d "$single"
-    fi
-done < "$TMP_ENV"
-  log "✅ Fallback terminé"
+    done < "$TMP_UPDATES"
+    log "✅ Fallback terminé"
+  fi
+else
+  log "ℹ️ Variables SF_ déjà alignées; aucune requête envoyée"
 fi
 
-# 4) Déploiement
-log "4/4 | Déploiement version $SF_APP_VERSION"
+# 3) Déploiement
+log "3/3 | Déploiement version $APP_VERSION"
 response_code=$(curl -s --max-time $TIMEOUT -w "%{http_code}" -o "$TMP_OUT" \
   "${AUTH_HEADER[@]}" -X GET "$API_URL/deploy?uuid=$APP_UUID&force=true")
 if [[ "$response_code" =~ ^2 ]]; then
