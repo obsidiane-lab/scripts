@@ -10,12 +10,10 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-# --- Configuration générale ---
 RETRIES=3
 DELAY=2
 TIMEOUT=15
 
-# --- Vérification des dépendances ---
 for cmd in bash curl jq mktemp grep env; do
   if ! command -v "$cmd" &>/dev/null; then
     echo "❌ Dépendance manquante: $cmd" >&2
@@ -52,52 +50,28 @@ curl_retry() {
   return 1
 }
 
-cleanup() { rm -f "$TMP_OUT" "$TMP_ENV" "$TMP_UPDATES"; }
-trap cleanup EXIT
+build_payload() {
+  local lines="$1"
+  jq -Rn '
+    [inputs
+      | capture("(?<raw>SF_(?<key>[^=]+))=(?<value>.*)")
+      | { key: .key, value: .value, is_build_time:true, is_literal:true }
+    ] | { data: . }' <<<"$lines"
+}
 
-TMP_OUT=$(mktemp)
-TMP_ENV=$(mktemp)
-TMP_UPDATES=$(mktemp)
+apply_sf_envs() {
+  local lines="$1"
+  if [[ -z "$lines" ]]; then
+    log "ℹ️ Aucune variable SF_ à appliquer"
+    return 0
+  fi
 
-# 1) Extraction des SF_ puis suppression du préfixe (sans suppression des variables existantes)
-log "1/3 | Extraction et renommage des variables SF_"
-mapfile -t SF_VARS < <(env | grep -E '^SF_' || true)
-if ((${#SF_VARS[@]} == 0)); then
-  log "ℹ️ Aucune variable SF_ détectée; aucune synchro nécessaire côté env"
-else
-  printf '%s\n' "${SF_VARS[@]}" > "$TMP_ENV"
-fi
-
-if [[ -s "$TMP_ENV" ]]; then
-  existing=$(curl_retry "${AUTH_HEADER[@]}" -X GET "$API_URL/applications/$APP_UUID/envs") || { log "❌ Impossible de récupérer les variables existantes"; exit 1; }
-
-  declare -A CURRENT_VALUES
-  while IFS=$'\t' read -r key value; do
-    CURRENT_VALUES["$key"]="$value"
-  done < <(echo "$existing" | jq -r '.[] | "\(.key)\t\(.value)"')
-
-  KEYS=()
-  while IFS= read -r line; do
-    raw_key="${line%%=*}"
-    value="${line#*=}"
-    key="${raw_key#SF_}"
-    KEYS+=("$key")
-
-    if [[ -v CURRENT_VALUES["$key"] && "${CURRENT_VALUES[$key]}" == "$value" ]]; then
-      continue
-    fi
-
-    jq -n --arg k "$key" --arg v "$value" \
-      '{key:$k,value:$v,is_build_time:true,is_literal:true}' >> "$TMP_UPDATES"
-  done < "$TMP_ENV"
-
+  log "Construction du payload SF_"
+  payload=$(build_payload "$lines") || { log "❌ Échec construction JSON"; exit 1; }
+  mapfile -t KEYS < <(jq -r '.data[].key' <<<"$payload")
   log "📋 Variables SF_ détectées (préfixe retiré): ${KEYS[*]}"
-fi
 
-# 2) Mises à jour ou ajouts ciblés des variables SF_ (sans toucher aux autres)
-if [[ -s "$TMP_UPDATES" ]]; then
-  payload=$(jq -s '{data: .}' "$TMP_UPDATES") || { log "❌ Échec construction JSON"; exit 1; }
-  log "2/3 | Mise à jour/ajout des variables SF_ (aucune suppression des existantes)"
+  log "Application des variables SF_ (add/override uniquement)"
   bulk_code=$(curl -s --max-time $TIMEOUT -w "%{http_code}" -o "$TMP_OUT" \
     "${AUTH_HEADER[@]}" "${JSON_HEADER[@]}" \
     -X PATCH "$API_URL/applications/$APP_UUID/envs/bulk" \
@@ -105,32 +79,42 @@ if [[ -s "$TMP_UPDATES" ]]; then
   )
   if [[ "$bulk_code" =~ ^2 ]]; then
     log "✅ Variables SF_ synchronisées (bulk)"
-  else
-    log "⚠️ Bulk KO ($bulk_code), fallback individuel"
-    while IFS= read -r update_line; do
-      [[ -z "$update_line" ]] && continue
-      key=$(jq -r '.key' <<<"$update_line")
-      val=$(jq -r '.value' <<<"$update_line")
-      single=$(jq -n --arg k "$key" --arg v "$val" '{key:$k,value:$v,is_build_time:true,is_literal:true}')
-      curl_retry "${AUTH_HEADER[@]}" "${JSON_HEADER[@]}" -X PATCH "$API_URL/applications/$APP_UUID/envs" -d "$single" \
-        || curl_retry "${AUTH_HEADER[@]}" "${JSON_HEADER[@]}" -X POST "$API_URL/applications/$APP_UUID/envs" -d "$single"
-    done < "$TMP_UPDATES"
-    log "✅ Fallback terminé"
+    return 0
   fi
-else
-  log "ℹ️ Variables SF_ déjà alignées; aucune requête envoyée"
-fi
 
-# 3) Déploiement
-log "3/3 | Déploiement version $APP_VERSION"
-response_code=$(curl -s --max-time $TIMEOUT -w "%{http_code}" -o "$TMP_OUT" \
-  "${AUTH_HEADER[@]}" -X GET "$API_URL/deploy?uuid=$APP_UUID&force=true")
-if [[ "$response_code" =~ ^2 ]]; then
-  cat "$TMP_OUT" | jq .
-  log "🎉 Déploiement terminé"
-else
-  log "❌ Déploiement échoué (HTTP $response_code)"
-  log "📝 Réponse de l'API :"
-  sed 's/^/   /' "$TMP_OUT" >&2
-  exit 1
-fi
+  log "⚠️ Bulk KO ($bulk_code), fallback individuel"
+  while IFS= read -r raw_line; do
+    [[ -z "$raw_line" ]] && continue
+    IFS='=' read -r raw val <<<"$raw_line"
+    key="${raw#SF_}"
+    single=$(jq -n --arg k "$key" --arg v "$val" '{key:$k,value:$v,is_build_time:true,is_literal:true}')
+    curl_retry "${AUTH_HEADER[@]}" "${JSON_HEADER[@]}" -X PATCH "$API_URL/applications/$APP_UUID/envs" -d "$single" \
+      || curl_retry "${AUTH_HEADER[@]}" "${JSON_HEADER[@]}" -X POST "$API_URL/applications/$APP_UUID/envs" -d "$single"
+  done <<<"$lines"
+  log "✅ Fallback terminé"
+}
+
+deploy_app() {
+  log "Déploiement version $APP_VERSION"
+  response_code=$(curl -s --max-time $TIMEOUT -w "%{http_code}" -o "$TMP_OUT" \
+    "${AUTH_HEADER[@]}" -X GET "$API_URL/deploy?uuid=$APP_UUID&force=true")
+  if [[ "$response_code" =~ ^2 ]]; then
+    cat "$TMP_OUT" | jq .
+    log "🎉 Déploiement terminé"
+  else
+    log "❌ Déploiement échoué (HTTP $response_code)"
+    log "📝 Réponse de l'API :"
+    sed 's/^/   /' "$TMP_OUT" >&2
+    exit 1
+  fi
+}
+
+cleanup() { rm -f "$TMP_OUT"; }
+trap cleanup EXIT
+
+TMP_OUT=$(mktemp)
+
+SF_LINES=$(env | grep -E '^SF_' || true)
+
+apply_sf_envs "$SF_LINES"
+deploy_app
