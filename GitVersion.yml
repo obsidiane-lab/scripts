@@ -1,6 +1,6 @@
 workflow: GitFlow/v1
 
-commit-message-incrementing: MergeMessageOnly
+commit-message-incrementing: Enabled
 major-version-bump-message: '(?i)#(major|majeur)\b'
 minor-version-bump-message: '(?i)#(minor|mineur)\b'
 patch-version-bump-message: '(?i)#(fix|patch)\b'
