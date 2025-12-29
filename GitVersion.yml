@@ -1,10 +1,9 @@
 workflow: GitFlow/v1
 
-commit-message-incrementing: MergeMessageOnly   # ou Enabled si vous préférez
+commit-message-incrementing: MergeMessageOnly
 major-version-bump-message: '(?i)#(major|majeur)\b'
 minor-version-bump-message: '(?i)#(minor|mineur)\b'
 patch-version-bump-message: '(?i)#(fix|patch)\b'
-no-bump-message: '(?i)#(skip|none)\b'
 
 branches:
   main:
@@ -12,30 +11,20 @@ branches:
     is-main-branch: true
     label: ''
     increment: Patch
-    prevent-increment:
-      of-merged-branch: true
     track-merge-message: true
 
   dev:
     regex: ^dev$
     label: dev
-    mode: ContinuousDelivery
+    mode: ManualDeployment
     increment: Minor
     source-branches: [main]
-    track-merge-message: true
+    track-merge-message: false
 
   feature:
     regex: ^feature[\/-](?<BranchName>[^\/]+)$
     label: feature-{BranchName}
     mode: ManualDeployment
-    increment: Minor
+    increment: None
     source-branches: [dev]
-    track-merge-message: true
-
-  fix:
-    regex: ^fix[\/-](?<BranchName>[^\/]+)$
-    label: fix-{BranchName}
-    mode: ManualDeployment
-    increment: Patch
-    source-branches: [main]
-    track-merge-message: true
+    track-merge-message: false
